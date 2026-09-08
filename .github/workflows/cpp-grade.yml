@@ -1,6 +1,8 @@
-# 可重複使用的 C++ 自動批改 workflow
+# 可重複使用的 C++ 自動批改 workflow（多小題版）
+# 一次作業內含多個獨立小題（例：ch2_1 ~ ch2_5），每題各自編譯、各自跑測資。
+# 規則：src/<題名>.cpp 對應 tests/<題名>/*.in 與同名 *.out
 # 各課程模板 repo 以 uses: yungder/course-workflows/.github/workflows/cpp-grade.yml@main 呼叫
-name: C++ 自動批改
+name: C++ 自動批改（多小題）
 
 on:
   workflow_call:
@@ -9,22 +11,18 @@ on:
         description: C++ 標準
         type: string
         default: "c++17"
-      src-glob:
-        description: 原始碼位置
+      src-dir:
+        description: 原始碼資料夾，內含各小題的 <題名>.cpp
         type: string
-        default: "src/*.cpp"
-      cases-dir:
-        description: 測資資料夾（內含 *.in 與同名 *.out）
+        default: "src"
+      tests-dir:
+        description: 測資根資料夾，內含各小題同名子資料夾
         type: string
-        default: "tests/cases"
+        default: "tests"
       timeout-sec:
         description: 單筆測資執行秒數上限
         type: string
         default: "5"
-      warnings-as-info:
-        description: true 時編譯警告只提醒不扣分
-        type: boolean
-        default: true
 
 jobs:
   grade:
@@ -32,92 +30,128 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 編譯
-        id: build
+      - name: 逐題編譯並批改
+        id: grade
+        shell: bash
         run: |
           set -o pipefail
+          shopt -s nullglob
+
+          SRC_DIR="${{ inputs.src-dir }}"
+          TESTS_DIR="${{ inputs.tests-dir }}"
+          STD="${{ inputs.std }}"
+          TIMEOUT="${{ inputs.timeout-sec }}"
+
           mkdir -p build
-          echo '## 編譯結果' >> "$GITHUB_STEP_SUMMARY"
-          if g++ -std=${{ inputs.std }} -O2 -Wall -Wextra -o build/main ${{ inputs.src-glob }} 2> build/compile.log; then
-            echo '✅ 編譯成功' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo '❌ **編譯失敗**' >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat build/compile.log >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          EXERCISES=()
+          for f in "$SRC_DIR"/*.cpp; do
+            EXERCISES+=("$(basename "$f" .cpp)")
+          done
+
+          if [ ${#EXERCISES[@]} -eq 0 ]; then
+            echo "::error::$SRC_DIR 底下找不到任何 .cpp 檔"
             exit 1
           fi
-          if [ -s build/compile.log ]; then
-            WARN=$(grep -c 'warning:' build/compile.log || true)
-            echo "⚠️ 編譯警告 $WARN 則（請盡量修掉，會列入程式品質評分）" >> "$GITHUB_STEP_SUMMARY"
-            echo '<details><summary>展開警告內容</summary>' >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat build/compile.log >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
-            echo "warnings=$WARN" >> "$GITHUB_OUTPUT"
-          else
-            echo "warnings=0" >> "$GITHUB_OUTPUT"
-          fi
 
-      - name: 執行測資
-        id: run
-        run: |
-          CASES_DIR='${{ inputs.cases-dir }}'
-          TIMEOUT='${{ inputs.timeout-sec }}'
-          shopt -s nullglob
-          INPUTS=("$CASES_DIR"/*.in)
-          TOTAL=${#INPUTS[@]}
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "::warning::$CASES_DIR 內找不到任何 .in 測資，跳過測試"
-            echo "passed=0" >> "$GITHUB_OUTPUT"; echo "total=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          TOTAL_EX=${#EXERCISES[@]}
+          PASS_EX=0
+          OVERALL_OK=1
 
-          PASS=0
           {
+            echo "## 題目批改結果"
             echo
-            echo '## 測資結果'
-            echo
-            echo '| 測資 | 結果 | 說明 |'
-            echo '|---|---|---|'
+            echo "| 題目 | 編譯 | 測資 | 備註 |"
+            echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          for IN in "${INPUTS[@]}"; do
-            NAME=$(basename "$IN" .in)
-            EXP="$CASES_DIR/$NAME.out"
-            if [ ! -f "$EXP" ]; then
-              echo "| $NAME | ⚠️ | 缺少對應的 $NAME.out |" >> "$GITHUB_STEP_SUMMARY"
+          for name in "${EXERCISES[@]}"; do
+            SRC="$SRC_DIR/$name.cpp"
+            BIN="build/$name"
+            LOG="build/$name.compile.log"
+            CASES_DIR="$TESTS_DIR/$name"
+
+            if g++ -std="$STD" -O2 -Wall -Wextra -o "$BIN" "$SRC" 2> "$LOG"; then
+              COMPILE_OK=1
+            else
+              COMPILE_OK=0
+              OVERALL_OK=0
+            fi
+
+            WARN_COUNT=0
+            if [ -s "$LOG" ]; then
+              WARN_COUNT=$(grep -c 'warning:' "$LOG" || true)
+            fi
+
+            if [ "$COMPILE_OK" -ne 1 ]; then
+              {
+                echo "| $name | ❌ 編譯失敗 | — | 見下方 |"
+              } >> "$GITHUB_STEP_SUMMARY"
+              {
+                echo
+                echo "<details><summary>❌ $name 編譯錯誤</summary>"
+                echo
+                echo '```'
+                cat "$LOG"
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
-            if timeout "$TIMEOUT" ./build/main < "$IN" > "build/$NAME.actual" 2> "build/$NAME.err"; then
-              # 比對時忽略行尾空白與檔尾多餘空行
-              if diff -q <(sed -e 's/[[:space:]]*$//' "$EXP" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba') \
-                         <(sed -e 's/[[:space:]]*$//' "build/$NAME.actual" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba') > /dev/null; then
-                PASS=$((PASS+1))
-                echo "| $NAME | ✅ 通過 | |" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ ! -d "$CASES_DIR" ]; then
+              echo "| $name | ✅ | ⚠️ 無測資 | 找不到 $CASES_DIR |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            INPUTS=("$CASES_DIR"/*.in)
+            CASE_TOTAL=0
+            CASE_PASS=0
+            CASE_DETAIL=""
+
+            for IN in "${INPUTS[@]}"; do
+              CNAME=$(basename "$IN" .in)
+              EXP="$CASES_DIR/$CNAME.out"
+              [ -f "$EXP" ] || continue
+              CASE_TOTAL=$((CASE_TOTAL+1))
+
+              if timeout "$TIMEOUT" "./$BIN" < "$IN" > "build/$name.$CNAME.actual" 2> "build/$name.$CNAME.err"; then
+                if diff -q <(sed -e 's/[[:space:]]*$//' "$EXP") \
+                           <(sed -e 's/[[:space:]]*$//' "build/$name.$CNAME.actual") > /dev/null; then
+                  CASE_PASS=$((CASE_PASS+1))
+                else
+                  CASE_DETAIL="$CASE_DETAIL $CNAME:答案錯誤"
+                fi
               else
-                echo "| $NAME | ❌ 答案錯誤 | 輸出與預期不符 |" >> "$GITHUB_STEP_SUMMARY"
+                RC=$?
+                if [ "$RC" -eq 124 ]; then
+                  CASE_DETAIL="$CASE_DETAIL $CNAME:逾時"
+                else
+                  CASE_DETAIL="$CASE_DETAIL $CNAME:執行錯誤"
+                fi
               fi
+            done
+
+            WARN_NOTE=""
+            if [ "$WARN_COUNT" -gt 0 ]; then WARN_NOTE="⚠️ $WARN_COUNT 則警告 "; fi
+
+            if [ "$CASE_TOTAL" -gt 0 ] && [ "$CASE_PASS" -eq "$CASE_TOTAL" ]; then
+              PASS_EX=$((PASS_EX+1))
+              echo "| $name | ✅ | ✅ $CASE_PASS/$CASE_TOTAL | ${WARN_NOTE}|" >> "$GITHUB_STEP_SUMMARY"
             else
-              RC=$?
-              if [ "$RC" -eq 124 ]; then
-                echo "| $NAME | ⏱️ 逾時 | 超過 ${TIMEOUT}s，可能有無窮迴圈 |" >> "$GITHUB_STEP_SUMMARY"
-              else
-                echo "| $NAME | 💥 執行錯誤 | 結束碼 $RC（可能是陣列越界或除以零）|" >> "$GITHUB_STEP_SUMMARY"
-              fi
+              OVERALL_OK=0
+              echo "| $name | ✅ | ❌ $CASE_PASS/$CASE_TOTAL | ${WARN_NOTE}${CASE_DETAIL} |" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
 
           {
             echo
-            echo "**通過 $PASS / $TOTAL 筆測資**"
+            echo "**共 $TOTAL_EX 題，完全通過 $PASS_EX 題**"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "passed=$PASS" >> "$GITHUB_OUTPUT"
-          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
 
-          [ "$PASS" -eq "$TOTAL" ]
+          echo "total_exercises=$TOTAL_EX" >> "$GITHUB_OUTPUT"
+          echo "passed_exercises=$PASS_EX" >> "$GITHUB_OUTPUT"
+
+          [ "$OVERALL_OK" -eq 1 ] && [ "$PASS_EX" -eq "$TOTAL_EX" ]
 
       - name: 上傳輸出結果供老師檢視
         if: always()
@@ -127,6 +161,6 @@ jobs:
           path: |
             build/*.actual
             build/*.err
-            build/compile.log
+            build/*.compile.log
           retention-days: 30
           if-no-files-found: ignore
